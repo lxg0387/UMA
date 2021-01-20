@@ -11,6 +11,7 @@ from thop import clever_format
 
 class NICE(object) :
     def __init__(self, args):
+        self.beta = args.beta
         self.light = args.light
 
         if self.light :
@@ -87,10 +88,6 @@ class NICE(object) :
         print("# cycle_weight : ", self.cycle_weight)
         print("# recon_weight : ", self.recon_weight)
 
-    ##################################################################################
-    # Model
-    ##################################################################################
-
     def build_model(self):
         """ DataLoader """
         train_transform = transforms.Compose([
@@ -128,8 +125,8 @@ class NICE(object) :
         print('[Network %s] Total number of parameters: ' % 'disA', params)
         print('[Network %s] Total number of FLOPs: ' % 'disA', macs)
         print('-----------------------------------------------')
-        _,_, _,  _, real_A_ae = self.disA(input)
-        macs, params = profile(self.gen2B, inputs=(real_A_ae, ))
+        # NEW ############################################################################
+        macs, params = profile(self.gen2B, inputs=(input, ))
         macs, params = clever_format([macs*2, params*2], "%.3f")
         print('[Network %s] Total number of parameters: ' % 'gen2B', params)
         print('[Network %s] Total number of FLOPs: ' % 'gen2B', macs)
@@ -143,9 +140,8 @@ class NICE(object) :
         self.G_optim = torch.optim.Adam(itertools.chain(self.gen2B.parameters(), self.gen2A.parameters()), lr=self.lr, betas=(0.5, 0.999), weight_decay=self.weight_decay)
         self.D_optim = torch.optim.Adam(itertools.chain(self.disA.parameters(), self.disB.parameters()), lr=self.lr, betas=(0.5, 0.999), weight_decay=self.weight_decay)
 
-
+    # NEW ############################################################################
     def train(self):
-        # writer = tensorboardX.SummaryWriter(os.path.join(self.result_dir, self.dataset, 'summaries/Allothers'))
         self.gen2B.train(), self.gen2A.train(), self.disA.train(), self.disB.train()
 
         self.start_iter = 1
@@ -158,11 +154,14 @@ class NICE(object) :
             self.D_optim.load_state_dict(params['D_optimizer'])
             self.G_optim.load_state_dict(params['G_optimizer'])
             self.start_iter = params['start_iter']+1
+            # NEW ############################################################################
+            '''
             if self.decay_flag and self.start_iter > (self.iteration // 2):
-                    self.G_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (self.start_iter - self.iteration // 2)
-                    self.D_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (self.start_iter - self.iteration // 2)
+                self.G_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (self.start_iter - self.iteration // 2)
+                self.D_optim.param_groups[0]['lr'] -= (self.lr / (self.iteration // 2)) * (self.start_iter - self.iteration // 2)
+            '''
+            ##################################################################################
             print("ok")
-          
 
         # training loop
         testnum = 4
@@ -181,7 +180,7 @@ class NICE(object) :
                         testB_iter = iter(self.testB_loader)
                         real_B, _ = testB_iter.next()
 
-        print("self.start_iter",self.start_iter)
+        print("self.start_iter", self.start_iter)
         print('training start !')
         start_time = time.time()
         for step in range(self.start_iter, self.iteration + 1):
@@ -206,18 +205,23 @@ class NICE(object) :
             # Update D
             self.D_optim.zero_grad()
 
-            real_LA_logit,real_GA_logit, real_A_cam_logit, _, real_A_z = self.disA(real_A)
-            real_LB_logit,real_GB_logit, real_B_cam_logit, _, real_B_z = self.disB(real_B)
+            # NEW ############################################################################
+            fake_A2B = self.gen2B(real_A)
+            fake_B2A = self.gen2A(real_B)
 
-            fake_A2B = self.gen2B(real_A_z)
-            fake_B2A = self.gen2A(real_B_z)
+            # OLD
+            real_LA_logit, real_GA_logit, real_A_cam_logit, _, real_A_z = self.disA(real_A)
+            real_LB_logit, real_GB_logit, real_B_cam_logit, _, real_B_z = self.disB(real_B)
+
+            # fake_A2B = self.gen2B(real_A_z)
+            # fake_B2A = self.gen2A(real_B_z)
+            ##################################################################################
 
             fake_B2A = fake_B2A.detach()
             fake_A2B = fake_A2B.detach()
 
             fake_LA_logit, fake_GA_logit, fake_A_cam_logit, _, _ = self.disA(fake_B2A)
             fake_LB_logit, fake_GB_logit, fake_B_cam_logit, _, _ = self.disB(fake_A2B)
-
 
             D_ad_loss_GA = self.MSE_loss(real_GA_logit, torch.ones_like(real_GA_logit).to(self.device)) + self.MSE_loss(fake_GA_logit, torch.zeros_like(fake_GA_logit).to(self.device))
             D_ad_loss_LA = self.MSE_loss(real_LA_logit, torch.ones_like(real_LA_logit).to(self.device)) + self.MSE_loss(fake_LA_logit, torch.zeros_like(fake_LA_logit).to(self.device))
@@ -232,23 +236,33 @@ class NICE(object) :
             Discriminator_loss = D_loss_A + D_loss_B
             Discriminator_loss.backward()
             self.D_optim.step()
-            # writer.add_scalar('D/%s' % 'loss_A', D_loss_A.data.cpu().numpy(), global_step=step)  
-            # writer.add_scalar('D/%s' % 'loss_B', D_loss_B.data.cpu().numpy(), global_step=step)  
+
+            # NEW ############################################################################
+            self.update_moving_average(self.gen2A.model, self.disB.model)
+            self.update_moving_average(self.gen2A.fc, self.disB.fc)
+            self.update_moving_average(self.gen2A.conv1x1, self.disB.conv1x1)
+            self.update_moving_average(self.gen2A.leaky_relu, self.disB.leaky_relu)
+            self.update_parameters(self.gen2A.lamda, self.disB.lamda)
+
+            self.update_moving_average(self.gen2B.model, self.disA.model)
+            self.update_moving_average(self.gen2B.fc, self.disA.fc)
+            self.update_moving_average(self.gen2B.conv1x1, self.disA.conv1x1)
+            self.update_moving_average(self.gen2B.leaky_relu, self.disA.leaky_relu)
+            self.update_parameters(self.gen2B.lamda, self.disA.lamda)
+            ##################################################################################
 
             # Update G
             self.G_optim.zero_grad()
 
-            _,  _,  _, _, real_A_z = self.disA(real_A)
-            _,  _,  _, _, real_B_z = self.disB(real_B)
-
-            fake_A2B = self.gen2B(real_A_z)
-            fake_B2A = self.gen2A(real_B_z)
+            # NEW ############################################################################
+            fake_A2B = self.gen2B(real_A)
+            fake_B2A = self.gen2A(real_B)
 
             fake_LA_logit, fake_GA_logit, fake_A_cam_logit, _, fake_A_z = self.disA(fake_B2A)
             fake_LB_logit, fake_GB_logit, fake_B_cam_logit, _, fake_B_z = self.disB(fake_A2B)
             
-            fake_B2A2B = self.gen2B(fake_A_z)
-            fake_A2B2A = self.gen2A(fake_B_z)
+            fake_B2A2B = self.gen2B(fake_B2A)
+            fake_A2B2A = self.gen2A(fake_A2B)
 
 
             G_ad_loss_GA = self.MSE_loss(fake_GA_logit, torch.ones_like(fake_GA_logit).to(self.device))
@@ -262,8 +276,8 @@ class NICE(object) :
             G_cycle_loss_A = self.L1_loss(fake_A2B2A, real_A)
             G_cycle_loss_B = self.L1_loss(fake_B2A2B, real_B)
 
-            fake_A2A = self.gen2A(real_A_z)
-            fake_B2B = self.gen2B(real_B_z)
+            fake_A2A = self.gen2A(real_A)
+            fake_B2B = self.gen2B(real_B)
 
             G_recon_loss_A = self.L1_loss(fake_A2A, real_A)
             G_recon_loss_B = self.L1_loss(fake_B2B, real_B)
@@ -275,31 +289,21 @@ class NICE(object) :
             Generator_loss = G_loss_A + G_loss_B
             Generator_loss.backward()
             self.G_optim.step()
-            # writer.add_scalar('G/%s' % 'loss_A', G_loss_A.data.cpu().numpy(), global_step=step)  
-            # writer.add_scalar('G/%s' % 'loss_B', G_loss_B.data.cpu().numpy(), global_step=step)  
 
             print("[%5d/%5d] time: %4.4f d_loss: %.8f, g_loss: %.8f" % (step, self.iteration, time.time() - start_time, Discriminator_loss, Generator_loss))
 
-            # for name, param in self.gen2B.named_parameters():
-            #     writer.add_histogram(name + "_gen2B", param.data.cpu().numpy(), global_step=step)
-
-            # for name, param in self.gen2A.named_parameters():
-            #     writer.add_histogram(name + "_gen2A", param.data.cpu().numpy(), global_step=step)
-
-            # for name, param in self.disA.named_parameters():
-            #     writer.add_histogram(name + "_disA", param.data.cpu().numpy(), global_step=step)
-
-            # for name, param in self.disB.named_parameters():
-            #     writer.add_histogram(name + "_disB", param.data.cpu().numpy(), global_step=step)
-
-            
             if step % self.save_freq == 0:
                 self.save(os.path.join(self.result_dir, self.dataset, 'model'), step)
 
             if step % self.print_freq == 0:
                 print('current D_learning rate:{}'.format(self.D_optim.param_groups[0]['lr']))
                 print('current G_learning rate:{}'.format(self.G_optim.param_groups[0]['lr']))
-                self.save_path("_params_latest.pt",step)
+                # NEW ############################################################################
+                if self.G_optim.param_groups[0]['lr'] <= 0 or self.D_optim.param_groups[0]['lr'] <= 0:
+                    print(" lr <= 0!")
+                    break
+                ##################################################################################
+                self.save_path("_params_latest.pt", step)
 
             if step % self.print_freq == 0:
                 train_sample_num = testnum
@@ -329,17 +333,14 @@ class NICE(object) :
                     _, _,  _, A_heatmap, real_A_z= self.disA(real_A)
                     _, _,  _, B_heatmap, real_B_z= self.disB(real_B)
 
-                    fake_A2B = self.gen2B(real_A_z)
-                    fake_B2A = self.gen2A(real_B_z)
+                    fake_A2B = self.gen2B(real_A)
+                    fake_B2A = self.gen2A(real_B)
 
-                    _, _,  _,  _,  fake_A_z = self.disA(fake_B2A)
-                    _, _,  _,  _,  fake_B_z = self.disB(fake_A2B)
+                    fake_B2A2B = self.gen2B(fake_B2A)
+                    fake_A2B2A = self.gen2A(fake_A2B)
 
-                    fake_B2A2B = self.gen2B(fake_A_z)
-                    fake_A2B2A = self.gen2A(fake_B_z)
-
-                    fake_A2A = self.gen2A(real_A_z)
-                    fake_B2B = self.gen2B(real_B_z)
+                    fake_A2A = self.gen2A(real_A)
+                    fake_B2B = self.gen2B(real_B)
 
                     A2B = np.concatenate((A2B, np.concatenate((RGB2BGR(tensor2numpy(denorm(real_A[0]))),
                                                                cam(tensor2numpy(A_heatmap[0]), self.img_size),
@@ -371,17 +372,14 @@ class NICE(object) :
                     _, _,  _, A_heatmap, real_A_z= self.disA(real_A)
                     _, _,  _, B_heatmap, real_B_z= self.disB(real_B)
 
-                    fake_A2B = self.gen2B(real_A_z)
-                    fake_B2A = self.gen2A(real_B_z)
+                    fake_A2B = self.gen2B(real_A)
+                    fake_B2A = self.gen2A(real_B)
 
-                    _, _,  _,  _,  fake_A_z = self.disA(fake_B2A)
-                    _, _,  _,  _,  fake_B_z = self.disB(fake_A2B)
+                    fake_B2A2B = self.gen2B(fake_B2A)
+                    fake_A2B2A = self.gen2A(fake_A2B)
 
-                    fake_B2A2B = self.gen2B(fake_A_z)
-                    fake_A2B2A = self.gen2A(fake_B_z)
-
-                    fake_A2A = self.gen2A(real_A_z)
-                    fake_B2B = self.gen2B(real_B_z)
+                    fake_A2A = self.gen2A(real_A)
+                    fake_B2B = self.gen2B(real_B)
 
                     A2B = np.concatenate((A2B, np.concatenate((RGB2BGR(tensor2numpy(denorm(real_A[0]))),
                                                                cam(tensor2numpy(A_heatmap[0]), self.img_size),
@@ -415,7 +413,6 @@ class NICE(object) :
         params['start_iter'] = step
         torch.save(params, os.path.join(dir, self.dataset + '_params_%07d.pt' % step))
 
-
     def save_path(self, path_g,step):
         params = {}
         params['gen2B'] = self.gen2B.state_dict()
@@ -437,6 +434,7 @@ class NICE(object) :
         self.G_optim.load_state_dict(params['G_optimizer'])
         self.start_iter = params['start_iter']
 
+    # NEW ############################################################################
     def test(self):
         self.load()
         print(self.start_iter)
@@ -444,8 +442,7 @@ class NICE(object) :
         self.gen2B.eval(), self.gen2A.eval(), self.disA.eval(),self.disB.eval()
         for n, (real_A, real_A_path) in enumerate(self.testA_loader):
             real_A = real_A.to(self.device)
-            _, _,  _, _, real_A_z= self.disA(real_A)
-            fake_A2B = self.gen2B(real_A_z)
+            fake_A2B = self.gen2B(real_A)
 
             A2B = RGB2BGR(tensor2numpy(denorm(fake_A2B[0])))
             print(real_A_path[0])
@@ -453,9 +450,19 @@ class NICE(object) :
 
         for n, (real_B, real_B_path) in enumerate(self.testB_loader):
             real_B = real_B.to(self.device)
-            _, _,  _, _, real_B_z= self.disB(real_B)
-            fake_B2A = self.gen2A(real_B_z)
+            fake_B2A = self.gen2A(real_B)
 
             B2A = RGB2BGR(tensor2numpy(denorm(fake_B2A[0])))
             print(real_B_path[0])
             cv2.imwrite(os.path.join(self.result_dir, self.dataset, 'fakeA', real_B_path[0].split('/')[-1]), B2A * 255.0)
+
+    # NEW ############################################################################
+    def update_moving_average(self, gen, dis):
+        for gen_params, dis_params in zip(gen.parameters(), dis.parameters()):
+            gen_weight, dis_weight = gen_params.data, dis_params.data
+            gen_params.data = dis_weight * self.beta + (1 - self.beta) * gen_weight
+
+    def update_parameters(self, gen, dis):
+        for gen_params, dis_params in zip(gen, dis):
+            gen_weight, dis_weight = gen_params.data, dis_params.data
+            gen_params.data = dis_weight * self.beta + (1 - self.beta) * gen_weight

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 
-
+# NEW ############################################################################
 class ResnetGenerator(nn.Module):
     def __init__(self, input_nc, output_nc, ngf=64, n_blocks=6, img_size=256, light=False):
         assert(n_blocks >= 0)
@@ -13,6 +13,28 @@ class ResnetGenerator(nn.Module):
         self.n_blocks = n_blocks
         self.img_size = img_size
         self.light = light
+
+        # NEW ############################################################################
+        ndf = ngf
+        model = [nn.ReflectionPad2d(1),
+                 nn.utils.spectral_norm(
+                     nn.Conv2d(input_nc, ndf, kernel_size=4, stride=2, padding=0, bias=True)),
+                 nn.LeakyReLU(0.2, True)]
+
+        for i in range(1, 2):
+            mult = 2 ** (i - 1)
+            model += [nn.ReflectionPad2d(1),
+                      nn.utils.spectral_norm(
+                          nn.Conv2d(ndf * mult, ndf * mult * 2, kernel_size=4, stride=2, padding=0, bias=True)),
+                      nn.LeakyReLU(0.2, True)]
+
+        self.model = nn.Sequential(*model)
+        mult = 2 ** (1)
+        self.fc = nn.utils.spectral_norm(nn.Linear(ndf * mult * 2, 1, bias=False))
+        self.conv1x1 = nn.Conv2d(ndf * mult * 2, ndf * mult, kernel_size=1, stride=1, bias=True)
+        self.leaky_relu = nn.LeakyReLU(0.2, True)
+        self.lamda = nn.Parameter(torch.zeros(1))
+        ##################################################################################
 
         n_downsampling = 2
 
@@ -46,13 +68,6 @@ class ResnetGenerator(nn.Module):
         UpBlock2 = []
         for i in range(n_downsampling):
             mult = 2**(n_downsampling - i)
-            # Experiments show that the performance of Up-sample and Sub-pixel is similar,
-            #  although theoretically Sub-pixel has more parameters and less FLOPs.
-            # UpBlock2 += [nn.Upsample(scale_factor=2, mode='nearest'),
-            #              nn.ReflectionPad2d(1),
-            #              nn.Conv2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=1, padding=0, bias=False),
-            #              ILN(int(ngf * mult / 2)),
-            #              nn.ReLU(True)]
             UpBlock2 += [nn.ReflectionPad2d(1),   
                          nn.Conv2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=1, padding=0, bias=False),
                          ILN(int(ngf * mult / 2)),
@@ -71,8 +86,18 @@ class ResnetGenerator(nn.Module):
         self.UpBlock0 = nn.Sequential(*UpBlock0)
         self.UpBlock2 = nn.Sequential(*UpBlock2)
 
-    def forward(self, z):
-        x = z
+    def forward(self, input):
+        # NEW ############################################################################
+        x = self.model(input)
+        x_0 = x
+        x = torch.cat([x, x], 1)
+        weight = list(self.fc.parameters())[0]
+        x = x * weight.unsqueeze(2).unsqueeze(3)
+        x = self.conv1x1(x)
+        x = self.lamda * x + x_0
+        x = self.leaky_relu(x)
+        ##################################################################################
+
         x = self.UpBlock0(x)
 
         if self.light:
